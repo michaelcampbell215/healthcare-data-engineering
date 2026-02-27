@@ -2,7 +2,6 @@
 -- 1. GROWTH ENGINE (CRO VIEW) - LORENZ CURVE (RECIPIENT GRAIN)
 -- Grain: Recipient (1.2M Rows). Optimized for "Whale Curve".
 -- =========================================================================
-
 WITH recipient_totals AS (
     SELECT 
         f.recipient_key,
@@ -115,6 +114,7 @@ WHERE p.product_type LIKE '%Device%'
   AND r.lat IS NOT NULL
 GROUP BY 1, 2, 3, 4, 5, 6, 9
 HAVING nearest_hub_distance_miles > 250;
+
 
 -- =========================================================================
 -- 5. DEMAND SENSING (SUPPLY CHAIN VIEW) - FORECAST SIGNALS
