@@ -1,16 +1,7 @@
 -- =========================================================================
--- TABLEAU EXPORT SCRIPT: PRODUCTION (15M ROWS OPTIMIZED)
--- Purpose: Generate Aggregated Datasets for Tableau
--- Strategy: Separate Grains & Use Temp Tables for Performance
--- Usage: Run queries, then Export to CSV.
--- =========================================================================
-
--- =========================================================================
 -- 1. GROWTH ENGINE (CRO VIEW) - LORENZ CURVE (RECIPIENT GRAIN)
 -- Grain: Recipient (1.2M Rows). Optimized for "Whale Curve".
--- Added 'State' and 'Specialty' for deep filtering.
 -- =========================================================================
--- SELECT 'Exporting Growth Metrics (Lorenz Curve)...' as Status;
 
 WITH recipient_totals AS (
     SELECT 
@@ -38,22 +29,19 @@ SELECT
         WHEN l.total_life_spend > 10000 THEN 'Gold (Top 10%)'
         ELSE 'Standard'
     END as recipient_tier,
-    -- Join Dimensions for Filtering
-    r.recipient_name, -- New: For "Hit List"
-    r.city,           -- New: For "Hit List"
+    r.recipient_name, 
+    r.city,           
     r.state,
-    CASE WHEN r.specialty IS NULL OR r.specialty = '' THEN 'Unknown Specialty' ELSE r.specialty END as specialty
-    -- Also handling NULLs in the Lorenz export too just in case
+    CASE WHEN r.specialty IS NULL OR r.specialty = '' THEN 'Unknown Specialty' ELSE r.specialty END as specialty   
 FROM lorenz_calc l
 JOIN dim_recipient r ON l.recipient_key = r.recipient_key
 WHERE l.total_life_spend > 0;
+
 
 -- =========================================================================
 -- 2. GROWTH ENGINE (CRO VIEW) - PRODUCT & NATURE (DIMENSION GRAIN)
 -- Optimization: Uses dim_nature (INT Join) instead of TEXT Join.
 -- =========================================================================
--- SELECT 'Exporting Growth Details (Product/Nature)...' as Status;
-
 SELECT 
     d.month_name,
     d.month,
@@ -75,13 +63,7 @@ GROUP BY 1, 2, 3, 4, 5, 6, 7;
 -- =========================================================================
 -- 3. RISK MATRIX (CCO VIEW) - ZIP + SPECIALTY + NATURE GRAIN
 -- Grain: Specialty + Zip + Nature (Slightly larger ~1M Rows). Optimized for Scatter + Map.
--- FIX: Added 'payment_nature' via dim_nature for fast performance.
--- FIX: Uses ref_zip_city.state_id instead of raw CMS state to fix map mismatches.
--- FIX 2: Filter out NULL Zips to prevent Unmapped data.
--- FIX 3: Coalesce NULL Specialty to 'Unknown Specialty' (Risk Flag).
 -- =========================================================================
--- SELECT 'Exporting Risk Metrics (Production)...' as Status;
-
 SELECT 
     LEFT(r.zip, 5) as zip, -- Normalize to 5-digit for mapping
     -- Coalesce: Trust the Zip Code Map first, fallback to raw data
@@ -97,16 +79,15 @@ FROM fact_payments f
 JOIN dim_recipient r ON f.recipient_key = r.recipient_key
 LEFT JOIN ref_zip_city ref ON LEFT(r.zip, 5) = ref.zip_code
 JOIN dim_nature n ON f.nature_key = n.nature_key
-WHERE r.zip IS NOT NULL AND r.zip != '' -- Exclude unmappable rows
+WHERE r.zip IS NOT NULL AND r.zip != '' 
 GROUP BY 1, 2, 3, 4
 HAVING total_risk_exposure > 5000;
+
 
 -- =========================================================================
 -- 4. LOGISTICS NETWORK (COO VIEW) - LAT/LNG CLUSTERS
 -- Grain: Lat/Lng + State (Aggregated).
--- Included recipient_state specifically for Demand Forecast linking.
 -- =========================================================================
--- SELECT 'Exporting Logistics Clusters (Production)...' as Status;
 SELECT 
     ROUND(r.lat, 2) as lat_cluster,
     ROUND(r.lng, 2) as lng_cluster,
@@ -140,13 +121,10 @@ HAVING nearest_hub_distance_miles > 250;
 -- Grain: City + Product (Aggregated). 
 -- PREREQUISITE: Run 'SOURCE analysis/27_demand_signaling.sql;' first!
 -- =========================================================================
--- SELECT 'Exporting Demand Forecast Signals...' as Status;
-
 SELECT * FROM tableau_demand_forecast 
 WHERE forecast_signal != 'MAINTENANCE (Stable Demand)'
   AND state IS NOT NULL 
   AND state != ''
-  -- Filter Military Codes (outside domestic supply chain scope)
   AND UPPER(city) NOT IN ('APO', 'FPO', 'DPO')
   AND state NOT IN ('AE', 'AP', 'AA');
 
