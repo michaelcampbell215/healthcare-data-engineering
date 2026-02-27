@@ -1,5 +1,5 @@
 -- =========================================================================
--- POPULATE WAREHOUSE (ETL -> STAR SCHEMA) - BATCHED EDITION (FIXED FK)
+-- POPULATE WAREHOUSE (ETL -> STAR SCHEMA)
 -- Purpose: Load clean data into Dimensions and Fact Table with Progress Tracking
 -- =========================================================================
 
@@ -19,7 +19,7 @@ BEGIN
     DECLARE unknown_product_id INT;
 
     -- =========================================================================
-    -- 1. POPULATE DIMENSIONS (These are fast enough to run in one go)
+    -- 1. POPULATE DIMENSIONS 
     -- =========================================================================
     
     -- Date Dimension
@@ -63,9 +63,6 @@ BEGIN
     INSERT IGNORE INTO dim_product (product_key, product_name, product_category, product_type, ndc)
     VALUES (-1, 'Unknown', 'Unknown', 'Unknown', 'Unknown');
     
-    -- Grab the ID (it will be -1 if manual insert worked, or auto-inc if collision)
-    -- But since we force -1, we can trust -1 exists.
-
     -- Recipient Dimension
     SELECT 'Populating DimRecipient...' AS Status;
     INSERT IGNORE INTO dim_recipient (
@@ -81,9 +78,9 @@ BEGIN
         MAX(recipient_specialty),
         MAX(recipient_npi),
         MAX(teaching_hospital_ccn),
-        MAX(recipient_city), -- Keep raw city for now
-        COALESCE(MAX(z.state_id), MAX(recipient_state)), -- Prioritize Clean State from Ref Table
-        COALESCE(MAX(z.zip_code), LEFT(MAX(recipient_zip), 5)), -- Prioritize Clean 5-digit Zip
+        MAX(recipient_city), -
+        COALESCE(MAX(z.state_id), MAX(recipient_state)), -
+        COALESCE(MAX(z.zip_code), LEFT(MAX(recipient_zip), 5)), 
         MAX(recipient_zip_population),
         MAX(z.lat),
         MAX(z.lng)
