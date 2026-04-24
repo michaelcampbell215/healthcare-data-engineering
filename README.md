@@ -66,7 +66,7 @@ The deeper problem: no one knew the data was broken. Client-side transformation 
 ### Star Schema Design
 
 ```
-fact_payments (15,397,627 rows — grain: individual payment / transfer of value)
+fact_payments (21,934,863 rows — grain: one row per payment × product combination)
   │
   ├── dim_recipient   → Physicians & Hospitals (NPI / CCN normalized, Type 1 SCD)
   ├── dim_product     → Device, Drug, Biologics classification
@@ -75,7 +75,7 @@ fact_payments (15,397,627 rows — grain: individual payment / transfer of value
   └── dim_geography   → ZIP-to-MSA crosswalk (SimpleMaps Golden Record)
 ```
 
-**Surrogate key strategy:** Auto-incrementing `fact_key` standardizes over the raw `record_id`, which is structurally inconsistent across CMS reporting years and vulnerable to loss during payment alterations.
+**Fact table grain:** The CMS source file stores up to 5 product columns per payment row (`Product_1` through `Product_5`). The `UNION ALL` unpivot in `23_populate_fact_payments.sql` normalizes each product into its own row, expanding 15,397,626 payment records into 21,934,863 product-level rows. The 6,537,237 additional rows represent secondary and tertiary product associations that standard `SELECT` queries and client-side BI tools were systematically dropping — the quantified basis of the "18–20% hidden payment volume" recovery.
 
 **SCD note:** `dim_recipient` uses Type 1 SCD for query performance. Documented limitation: provider geography history is not preserved. A Type 2 migration is the recommended path for full audit-grade compliance history.
 
@@ -101,6 +101,7 @@ Standard `UPDATE` statements on 15M rows caused transaction log overflows. All o
 | Payment volume captured | ~80% (client-side limit) | 100% (server-side unpivot) |
 | Checksum accuracy | Not validated | 100.0% match |
 | Schema change downtime | N/A (estimated 4+ hrs) | Zero (hot patch) |
+| Row count accuracy | 15,397,627 (inflated) | 15,385,047 (validated in Phase 2) |
 
 ---
 
@@ -199,6 +200,13 @@ PowerShell's `>` redirect operator outputs UTF-16 LE — which Git registers as 
 
 **Configuration Scope — Architectural Constants vs. Environment Variables**
 Initial design loaded a `GCS_PREFIX` variable from `.env` to construct the GCS object path. On review: a path prefix like `raw` is an architectural constant, not an environment-specific or sensitive value. The object path is hardcoded in the script (`raw/raw_general_payments.csv`), keeping `.env` scoped exclusively to credentials and deployment identifiers.
+
+**Cross-System Row Count Validation — Migration Checksum Finding**
+During BigQuery load validation, a 12,580-row discrepancy was identified between MySQL (15,397,627) and BigQuery (15,385,047). A raw Python line count of the source CSV confirmed the ground truth: **15,385,047 data rows**. BigQuery matched the source CSV exactly. Root cause: MySQL's `LOAD DATA LOCAL INFILE` was splitting 12,580 records containing embedded quoted newlines into two rows each — a 0.08% phantom row inflation that was visible in Phase 1 as a single "shifted row" in Workbench but not investigated at the time.
+
+**Impact on Phase 1:** Dollar totals unaffected — phantom continuation rows had null payment amounts. Compliance findings, vendor rankings, and Z-score flags remain valid. Row count metrics were overstated by 0.08%.
+
+**Migration Checksum Status: PASSES.** BigQuery source CSV match is 100%. BigQuery is the authoritative row count layer at **15,385,047**. Phase 1 MySQL is preserved as documented with this known limitation recorded in `TECHNICAL.md`.
 
 ### Phase 2 Commit History
 

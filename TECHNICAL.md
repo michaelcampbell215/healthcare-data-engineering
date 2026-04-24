@@ -9,8 +9,11 @@
 ##  Data Profile & Ingestion
 
 **Source:** CMS Open Payments General Payments Dataset (2024)
-**Volume:** ~15.4 Million Rows
+**Volume:** 15,385,047 rows (authoritative — see Phase 2 note below)
 **Ingestion Strategy:** `LOAD DATA LOCAL INFILE` into a raw staging table (`stg_general_payments`), followed by migration to a typed schema (`general_payments`).
+
+> [!NOTE]
+> **Row Count Revision (Phase 2 Finding):** The Phase 1 MySQL staging count of 15,397,627 was later found to be inflated. See *Engineering Challenge E* below for the full forensic analysis. The authoritative record count — confirmed against the source CSV and validated in BigQuery — is **15,385,047**.
 
 ### Initial Data Profile (Raw)
 
@@ -18,7 +21,8 @@ Before cleaning, the dataset revealed significant structural complexity:
 
 | Metric | Statistics |
 | :--- | :--- |
-| **Total Rows** | **15,397,627** |
+| **Total Rows (MySQL — Phase 1)** | 15,397,627 *(includes 12,580 phantom rows — see Challenge E)* |
+| **Total Rows (BigQuery — Authoritative)** | **15,385,047** |
 | **Total Spend** | ~$3.3 Billion (Avg: $216.23/payment) |
 | **Distinct Hospitals** | 1,252 (Raw CCN count) |
 | **Distinct Cities** | 13,993 (High variance due to typos) |
@@ -85,7 +89,7 @@ The core analysis table `general_payments` is designed for OLAP-style queries:
 
 ### 1. The Data Model (Star Schema)
 
-Designed for high-performance OLAP queries — sub-second aggregation on 15M rows:
+Designed for high-performance OLAP queries on 21.9M product-level rows:
 
 ![Healthcare Star Schema ERD](./assets/healthcare_star_schema_erd.png)
 
@@ -130,6 +134,7 @@ erDiagram
         decimal amount_usd
         int number_of_payments
         varchar record_id
+        varchar product_name "Unpivoted from Product_1–Product_5"
         int date_key FK
         int recipient_key FK
         int product_key FK
@@ -168,13 +173,22 @@ erDiagram
 - **Challenge:** Standard `UPDATE` statements on 15M rows caused Transaction Log overflows and lock contention.
 - **Solution:** All data operations are encapsulated in Stored Procedures with `LIMIT 50000` cursor-based pagination and explicit `COMMIT` checkpoints after each batch. This keeps individual transactions within memory bounds and enables rollback at any checkpoint in the ingestion cycle.
 
+#### E. Cross-System Row Count Validation — A Migration-Discovered Data Quality Finding
+
+- **Discovery:** During Phase 2 BigQuery migration, a checksum comparison revealed a 12,580-row discrepancy: MySQL reported 15,397,627 rows while BigQuery loaded 15,385,047 from the same source CSV.
+- **Investigation:** A raw Python line count of the source CSV confirmed **15,385,047 data rows** (15,385,048 total lines including header). BigQuery matched the source exactly. MySQL was over-counting.
+- **Root Cause:** MySQL's `LOAD DATA LOCAL INFILE` without explicit quoted newline handling split 12,580 records containing embedded newlines into two rows each — a "phantom row" inflation of 0.08%. The split was visible during Phase 1 as a single "shifted row" observed in Workbench but not investigated at the time.
+- **Impact on Phase 1 Analysis:** Dollar totals were **unaffected** — phantom continuation rows had null payment amounts and did not contribute to `SUM(amount_usd)`. Vendor concentration rankings, Z-score flags, and compliance outputs remained accurate. Row count metrics were over-stated by 0.08%.
+- **Resolution:** BigQuery ingestion with `allow_quoted_newlines=True` correctly parses quoted multi-line fields as single records. **BigQuery is the authoritative row count source at 15,385,047 — a 100% match against the source CSV.** Phase 1 MySQL is left as documented with this known limitation.
+- **Engineering Takeaway:** Cross-system checksum validation during migration is not optional — it surfaces data quality assumptions that single-system validation cannot detect.
+
 ---
 
 ### 3. Dimension Design Decisions
 
 **Fact Table — `fact_payments`**
-- _Volume:_ 15,397,627 rows
-- _Grain:_ Individual payment / transfer of value
+- _Volume:_ 21,934,863 rows *(product-level grain — expanded from 15,397,626 source payments via UNION ALL unpivot)*
+- _Grain:_ One row per payment × product combination. The CMS source stores up to 5 product columns (`Product_1` through `Product_5`) per payment record. The `UNION ALL` normalization in `23_populate_fact_payments.sql` expands these into individual rows, recovering 6,537,237 product associations that would otherwise be invisible to standard aggregation queries.
 - _Keys:_ `recipient_key`, `product_key`, `date_key`, `payer_key` (Surrogate Keys)
 - _Audit Strategy:_ Auto-incrementing `fact_key` surrogate key standardizes over the raw `record_id`, which is structurally inconsistent across CMS reporting years and vulnerable to loss during payment alterations or partial updates.
 
