@@ -1,0 +1,7 @@
+version: 2
+sources:
+  - name: cms_open_payments
+    database: healthcare-payments-analysis
+    schema: cms_open_payments_raw
+    tables:
+      - name: raw_general_payments
