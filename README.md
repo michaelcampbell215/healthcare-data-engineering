@@ -29,22 +29,21 @@ CMS Open Payments (Federal Source)
          │
          ▼ load_to_bq.py (load from GCS URI)
   BigQuery Dataset: cms_open_payments_raw
-  └── raw_general_payments  (15.4M rows)
-  └── raw_physicians
-  └── raw_companies
+  └── raw_general_payments        (15.4M rows — 2024 program year, never mutated)
          │
-         ▼ dbt staging models (views)
-  BigQuery Dataset: staging
-  └── stg_general_payments
-  └── stg_physicians
-  └── stg_companies
+         ▼ dbt staging models (BigQuery views — raw data never touched)
+  cms_open_payments_raw
+  └── stg_general_payments        (typed, cleaned, province/zip/city/specialty healed)
+  └── stg_us_cities               (SimpleMaps US Cities golden record via dbt seed)
          │
-         ▼ dbt mart models (materialized tables)
-  BigQuery Dataset: marts
-  └── fct_payments
-  └── dim_physician
-  └── dim_company
-  └── dim_nature_of_payment
+         ▼ dbt mart models (BigQuery tables — 23/23 schema.yml tests passing)
+  cms_open_payments_raw
+  └── fct_payments                (17.8M rows — one row per payment × product slot)
+  └── dim_physician               (650K unique physicians)
+  └── dim_hospital                (1.3K unique teaching hospitals)
+  └── dim_company                 (1.7K unique payer entities)
+  └── dim_product                 (10.8K unique products)
+  └── dim_nature_of_payment       (56 nature/form combinations)
          │
          ▼
      Tableau Dashboard
@@ -143,11 +142,27 @@ healthcare-data-engineering/
 │       ├── raw_physicians.json
 │       └── raw_companies.json
 │
-├── dbt/                               # Phase 2 — Transformation layer
+├── transform/                          # Phase 2 — dbt transformation layer
+│   ├── macros/
+│   │   ├── clean_name.sql              # INITCAP + regex name standardization macro
+│   │   └── clean_hospital_name.sql     # hospital system rollup (200+ CASE entries)
 │   ├── models/
-│   │   ├── staging/                   # views: clean, renamed columns from raw
-│   │   └── marts/                     # tables: Star Schema fact + dimensions
-│   ├── tests/
+│   │   ├── staging/
+│   │   │   ├── stg_general_payments.sql  # typed, cleaned, province/zip/city/specialty healed
+│   │   │   ├── stg_us_cities.sql         # UNNEST(SPLIT()) replaces recursive CTE
+│   │   │   ├── src_cms.yml               # source declarations
+│   │   │   └── schema.yml                # staging model tests
+│   │   └── marts/
+│   │       ├── dim_physician.sql
+│   │       ├── dim_hospital.sql
+│   │       ├── dim_product.sql
+│   │       ├── dim_company.sql
+│   │       ├── dim_nature_of_payment.sql
+│   │       ├── fct_payments.sql
+│   │       └── schema.yml                # 23 tests: not_null, unique, relationships
+│   ├── seeds/
+│   │   └── uscities.csv                # SimpleMaps US Cities golden record
+│   ├── packages.yml
 │   └── dbt_project.yml
 │
 ├── .env.example                       # environment variable template (safe to commit)
@@ -208,6 +223,48 @@ During BigQuery load validation, a 12,580-row discrepancy was identified between
 
 **Migration Checksum Status: PASSES.** BigQuery source CSV match is 100%. BigQuery is the authoritative row count layer at **15,385,047**. Phase 1 MySQL is preserved as documented with this known limitation recorded in `TECHNICAL.md`.
 
+### Milestone 2: dbt Transformation Layer — Staging + Dimension Models
+
+**The Problem:** Phase 1's MySQL architecture performed all data cleaning through batch `UPDATE` stored procedures that mutated staging tables in-place — making the pipeline stateful, slow to re-run, and opaque to version control. Complex recursive CTEs were required just to parse space-delimited ZIP code lists.
+
+**The Decision:** Adopted a cloud-native ELT pattern using **dbt** + **BigQuery**. Raw data is never touched after load; all cleaning is computed as views and materialized tables on top of the raw layer.
+
+**Staging Layer (`stg_general_payments`, `stg_us_cities`):**
+- Typed, renamed, and healed all columns from `cms_open_payments_raw.raw_general_payments` as a BigQuery view
+- Ported Phase 1's `BatchCleanProvince` stored procedure into a `CASE/COALESCE` expression — CMS records that misroute state codes into `recipient_province` and zip codes into `recipient_postal_code` are corrected at the staging layer, healing all downstream models simultaneously
+- Replaced recursive CTE ZIP parsing with BigQuery's native `UNNEST(SPLIT(zips, ' '))`, eliminating 40+ lines of MySQL loop logic
+
+**Macros (`clean_name`, `clean_hospital_name`):**
+- `clean_name.sql`: Wraps `INITCAP()` + regex to strip titles, collapse spaces, and null sentinel values — replaces Phase 1's 40-line MySQL `TitleCase` UDF
+- `clean_hospital_name.sql`: 200+ CASE entry hospital system rollup (AdventHealth, HCA Healthcare, Mayo Clinic, etc.) ported from `14_clean_hospitals.sql` — accepts `hospital_name`, `city`, and `state` as parameters since system assignment requires geographic tiebreaking
+
+**Dimension Models (all materialized as BigQuery tables):**
+- `dim_physician` — Covered Recipient Physicians; `clean_name` macro applied; dual geographic join (zip-first, city+state fallback via `city_lookup` CTE) attaches lat/lng/population from SimpleMaps golden record; `QUALIFY ROW_NUMBER() PARTITION BY recipient_profile_id ORDER BY program_year DESC` enforces one row per physician
+- `dim_hospital` — Teaching Hospitals; `clean_hospital_name` macro applied; same dual geo join and QUALIFY deduplication pattern
+- `dim_product` — `UNION ALL` unpivot across all 5 CMS product slots recovers 18–20% of product associations silently dropped by single-column queries
+- `dim_company` — Manufacturer/GPO payer dimension; full Tier 1 + Tier 2 brand-to-parent consolidation CASE (Janssen → Johnson & Johnson, Covidien → Medtronic, etc.) ported from `15_clean_payers.sql`; subsidiary names stripped of legal suffixes ("A Division Of", "D/b/a") via `REGEXP_EXTRACT`; parent/subsidiary separation preserved for compliance rollup analysis; QUALIFY deduplication on subsidiary_id
+- `dim_nature_of_payment` — Distinct CMS payment nature + form combinations; grain is one row per nature/form pair
+
+**Fact Table (`fct_payments`):**
+- Grain: one row per payment × product combination — same `UNION ALL` unpivot pattern as Phase 1
+- 15.4M CMS payment records expand to **17.8M rows** across 5 product slots
+- Surrogate key `payment_id = generate_surrogate_key(['record_id', 'product_slot'])` ensures uniqueness after the unpivot
+- Foreign keys: `recipient_profile_id → dim_physician`, `teaching_hospital_ccn → dim_hospital`, `subsidiary_id → dim_company`, `payment_nature → dim_nature_of_payment`
+- `record_id` retained as a traceability column for auditing back to the CMS source record
+
+**Phase 1 Cleaning Gaps Ported to Staging:**
+- **Data quality purge** — filters `record_id = 'No'`, `program_year < 2000`, and numerically-corrupted `payer_name` values (previously in `07_data_quality_purge.sql`)
+- **Specialty extraction** — `REGEXP_EXTRACT(specialty_col, r'[^|]+$')` pulls the last pipe segment from each of CMS's 6 raw specialty columns, replacing Phase 1's `SUBSTRING_INDEX(col, '|', -1)`; `recipient_primary_specialty` added as a dedicated column for dim_physician
+- **Product name cleaning** — `INITCAP` + trademark strip (`\(R\)|\(TM\)`) applied to all 5 product name slots; replaces Phase 1's `CleanProductName()` UDF
+- **Recipient name normalization** — `INITCAP(TRIM(...))` applied to first/middle/last/suffix columns; replaces Phase 1's `TitleCase(CleanName(...))`
+
+**dbt Tests (`schema.yml`) — 23/23 passing:**
+- `not_null` + `unique` on all natural and surrogate keys
+- `relationships` tests on all 4 fct_payments foreign keys with `where` config to scope physician FK check to physician-type rows only (CMS assigns `recipient_profile_id` to all recipient types — hospital IDs would otherwise fail the physician FK test)
+
+**The Trade-off:** Traded local stored procedure simplicity for dbt's Jinja macro system and BigQuery-specific SQL functions. The gain: every transformation is a reviewable, testable Git file; raw data is always preserved and re-queryable; the full pipeline re-runs from scratch in under 30 seconds rather than hours.
+
+
 ### Phase 2 Commit History
 
 ```
@@ -264,9 +321,13 @@ See `.env.example` for all required environment variables and authentication opt
 
 ## Next Steps
 
-- **Phase 2 — Complete:** Finish `upload_to_gcs.py`, build `load_to_bq.py` with row count validation, define schema JSON files
-- **Phase 2 — dbt:** Initialize dbt project, build staging models and Star Schema mart layer, add tests and schema.yml documentation
+- ~~**Phase 2 — Cloud Ingestion:** `upload_to_gcs.py`, `load_to_bq.py`, schema JSON files~~ ✅ Complete
+- ~~**Phase 2 — dbt Staging + Dimensions:** `stg_general_payments`, `stg_us_cities`, all dimension models~~ ✅ Complete
+- ~~**Phase 2 — dbt Fact Table:** `fct_payments.sql` — 17.8M rows, surrogate key, 5-slot UNION ALL unpivot~~ ✅ Complete
+- ~~**Phase 2 — dbt Tests:** `schema.yml` with 23 tests — not_null, unique, relationships — 23/23 passing~~ ✅ Complete
 - **Phase 2 — Merge:** Merge `bigquery-migration` → `main`, tag `v2.0-bigquery-migration`
+- **Phase 3 — Load Historical Years:** Extend pipeline to load 2013–2023 program years into the same BigQuery dataset without schema changes
 - **Phase 3 — Research Payments:** Extend to `raw_research_payments`, build cross-dataset conflict-of-interest flag layer
 - **Phase 3 — Orchestration:** Airflow DAG to automate the full pipeline refresh cycle
-- **SCD Type 2 on dim_recipient:** Implement full provider geography history for audit-grade compliance tracking across CMS reporting years
+- **Phase 3 — Specialty Standardization:** Port `ref_specialties` synonym mappings ('Orthopaedic Surgery' → 'Orthopedic Surgery') as a dbt seed + CASE layer in `dim_physician`
+- **SCD Type 2 on dim_physician/dim_hospital:** Implement full provider geography history for audit-grade compliance tracking across CMS reporting years

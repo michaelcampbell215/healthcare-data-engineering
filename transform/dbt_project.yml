@@ -9,11 +9,6 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-seeds:
-  # Builds seeds into '<your_schema_name>_raw'
-  healthcare_spend:
-    +schema: raw
-
 models:
   healthcare_spend:
     +static_analysis: strict

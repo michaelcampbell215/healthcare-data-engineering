@@ -1,0 +1,19 @@
+version: 2
+
+models:
+  - name: stg_general_payments
+    description: "Staging view for CMS Open Payments general payments data (2024 program year).
+      Filters corrupted records and applies base cleaning before mart models.
+      Additional program years can be loaded without schema changes."
+    columns:
+      - name: record_id
+        tests:
+          - not_null
+          - unique
+      - name: program_year
+        tests:
+          - not_null
+      - name: amount_usd 
+        tests:
+          - not_null
+          

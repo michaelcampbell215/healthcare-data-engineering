@@ -1,6 +1,6 @@
 # Engineering Case Study: Scaling a 15M-Row Healthcare Compliance Warehouse
 
-> **Role:** Analytics Engineer | **Stack:** MySQL 8.0, Tableau | **Focus:** ETL Pipeline & Database Architecture
+> **Role:** Analytics Engineer | **Stack:** MySQL 8.0 → BigQuery + dbt Core, Tableau | **Focus:** ETL/ELT Pipeline & Database Architecture
 >
 > This document is the deep-dive companion to the [Healthcare Data Engineering Pipeline README](./README.md). It covers the specific engineering decisions, failure modes encountered, and solutions implemented during the build of the CMS Open Payments Star Schema warehouse.
 
@@ -234,20 +234,159 @@ As data volume exceeded 10M rows, standard aggregations began to time out.
 
 ---
 
+---
+
+## Phase 2 — BigQuery + dbt Engineering Notes
+
+### ELT vs ETL Shift
+
+Phase 1 was ETL: data was mutated in-place by stored procedures (`UPDATE general_payments SET ... WHERE ...`). Raw data was destroyed at each step. Re-running required restoring from backup.
+
+Phase 2 is ELT: the raw BigQuery table (`raw_general_payments`) is never touched after load. All cleaning is expressed as SQL `SELECT` expressions in dbt views and materialized tables. Re-running `dbt run` rebuilds the entire pipeline from scratch in ~20 seconds. The raw source is always available for inspection.
+
+### BigQuery SQL Differences Encountered
+
+Porting Phase 1 MySQL logic to BigQuery required several syntax substitutions that are not obvious from documentation alone:
+
+| Phase 1 MySQL | Phase 2 BigQuery | Reason |
+|---|---|---|
+| `SUBSTRING_INDEX(col, '\|', -1)` | `REGEXP_EXTRACT(col, r'[^|]+$')` | BigQuery has no `SUBSTRING_INDEX` |
+| `col REGEXP '^[0-9]+'` | `REGEXP_CONTAINS(col, r'^\d+')` | BigQuery uses `REGEXP_CONTAINS`, RE2 syntax |
+| `TitleCase(str)` (custom UDF) | `INITCAP(str)` | BigQuery built-in; handles Unicode correctly |
+| `ANY_VALUE(col ORDER BY ...)` | `ARRAY_AGG(col ORDER BY ... LIMIT 1)[OFFSET(0)]` | `ANY_VALUE` in BigQuery does not support `ORDER BY` — PostgreSQL-only extension |
+| `'Children''s'` (double-quote escape) | `'Children\'s'` (backslash escape) | BigQuery treats `''` as two adjacent string literals, not an escape sequence |
+| `UNNEST(SPLIT())` recursive CTE | Native `UNNEST(SPLIT())` | BigQuery supports this natively; MySQL required a 40-line recursive CTE |
+
+### Phase 1 Cleaning Gap Analysis
+
+Before declaring Phase 2 complete, all Phase 1 stored procedures (scripts 7–20) were audited against the dbt staging model to identify gaps. Outcome:
+
+**Ported (High/Medium priority):**
+- `07_data_quality_purge` — corrupted row filter (`record_id='No'`, `program_year<2000`, numeric `payer_name`) added as staging `WHERE` clause
+- `19_clean_recipient_specialty` — `REGEXP_EXTRACT(col, r'[^|]+$')` extracts the most-specific segment from CMS pipe-delimited specialty strings; `recipient_primary_specialty` added as a dedicated column
+- `16_clean_products` — `INITCAP` + trademark strip (`\(R\)|\(TM\)`) applied to all 5 product name slots
+- `08_clean_recipient_names` — `INITCAP(TRIM(...))` applied to first/middle/last/suffix columns
+- `12_clean_city` (partial) — `NULLIF(INITCAP(TRIM(recipient_city)), '')` applied in staging so the SimpleMaps fallback city is title-cased rather than raw CMS ALL CAPS; `REGEXP_EXTRACT(zip, r'^\d{5}')` normalizes ZIP+4 codes (e.g. `03811-2131`) to 5 digits, tightening the SimpleMaps ZIP join and fixing display
+- `uscities` seed augmentation — SimpleMaps does not include PO Box ZIPs or every small municipality; added Burlington CT (06013), West Hartford CT (06107/06110/06117/06119), and Atlanta PO Box ZIP (30384) to cover gaps identified via post-build validation queries
+
+**Deferred (Low priority):**
+- `10_clean_military` — APO/FPO address fixes for ~100 military base records
+- `11_clean_locations` (CleanCity) — abbreviation expansion (Ft→Fort, Mt→Mount); superseded by SimpleMaps zip join which provides clean city names for the vast majority of records
+- `13_clean_addresses` (CleanAddress) — street suffix expansion (AVE→AVENUE); address lines are display-only fields not used in analysis
+- `20_apply_specialty_mappings` — synonym normalization requires `ref_specialties` seed table; deferred to Phase 3
+
+### dbt Test Engineering
+
+Running `dbt test` for the first time against the live BigQuery tables surfaced four real data issues that the model code had not accounted for:
+
+**1. Dimension uniqueness via `SELECT DISTINCT`**
+`dim_physician`, `dim_hospital`, and `dim_company` all used `SELECT DISTINCT` across all columns to deduplicate. The same physician appearing in 10 different payment records with slightly different address data across program years produces 10 rows — `SELECT DISTINCT` cannot deduplicate on a single natural key.
+
+Fix: `QUALIFY ROW_NUMBER() OVER (PARTITION BY natural_key ORDER BY program_year DESC) = 1` — keeps the most recent year's record per entity, replacing all occurrences of `SELECT DISTINCT` in dimension models.
+
+**2. FK scope on `fct_payments → dim_physician`**
+CMS assigns `covered_recipient_profile_id` to ALL recipient types — physicians AND hospitals. Hospital profile IDs are not in `dim_physician` (which filters on `recipient_type = 'Covered Recipient Physician'`), so the unscoped relationships test produced 6.3M false failures.
+
+Fix: added `config: where: "recipient_type = 'Covered Recipient Physician'"` to the relationships test in `schema.yml`, scoping the FK check to physician payments only.
+
+**3. `ANY_VALUE(col ORDER BY ...)` not supported**
+The `city_lookup` CTE in `dim_physician` and `dim_hospital` used `ANY_VALUE(city ORDER BY population DESC)` to pick the most-populated version of a city name for the fallback geo join. BigQuery silently rejects this with a runtime error.
+
+Fix: `ARRAY_AGG(city ORDER BY population DESC LIMIT 1)[OFFSET(0)]` — BigQuery's equivalent pattern for "pick the value from the highest-population row."
+
+**4. Apostrophe escaping in CASE strings**
+The `clean_hospital_name` macro and `dim_company` CASE block used `''` (double single-quote) to escape apostrophes inside string literals (`'Children''s Hospital'`). BigQuery parses this as two adjacent string literals and throws a syntax error.
+
+Fix: replaced all `''s` with `\'s` throughout both files.
+
+**5. Corrupted payment dates from CMS upstream (`date_of_payment = '11/30/0002'`)**
+After building `dim_date` (a `dbt_utils.date_spine` table covering 2013–2026), the relationships test `fct_payments.payment_date → dim_date.full_date` failed with 64 results — 64 payment records whose parsed `payment_date` fell outside the dim_date range.
+
+Investigation: the raw `date_of_payment` field for all 64 records contained the literal string `'11/30/0002'` — year 0002 instead of 2024. These are real payments with valid physicians, companies, and dollar amounts. `program_year = 2024` and `payment_publication_date = 01/23/2026` on every affected record confirm the payments are genuine; only the year was corrupted at the CMS source.
+
+Two fixes were considered:
+- Hard-code the 64 known `record_id` values — precise but brittle. CMS reprocesses records and reassigns IDs; future loads with the same corruption pattern get no fix.
+- Generic sentinel using domain knowledge — the CMS Open Payments program launched August 2013. Any `payment_date < '2013-01-01'` is definitionally an upstream error and will never be a legitimate payment.
+
+Fix: added a `cleaned` CTE in `stg_general_payments` that sits between `staged` and the final `SELECT`. For any record where `payment_date < '2013-01-01'`, the date is rebuilt as `DATE(program_year, EXTRACT(MONTH FROM payment_date), EXTRACT(DAY FROM payment_date))`. The month and day components (November 30) are preserved from the corrupted string; only the year is replaced by the per-row `program_year` value. For the 64 current records this produces `2024-11-30`. If a future 2022 load contains the same corruption, the same expression produces `2022-11-30` automatically — no code change required.
+
+Final test result: **29/29 tests passing.**
+
+---
+
 ##  Repository Structure
 
 ```text
 ├── assets/
-│   └── EER_DIAGRAM.png                     # Entity-Relationship Diagram
+│   ├── EER_DIAGRAM.png                         # MySQL Entity-Relationship Diagram
+│   └── uscities.csv                            # SimpleMaps US Cities reference data
+├── bigquery/
+│   ├── load/
+│   │   └── load_to_bq.py                       # Phase 2: BigQuery table loader
+│   ├── migrate/
+│   │   └── upload_to_gcs.py                    # Phase 2: GCS upload script
+│   └── schemas/
+│       └── raw_general_payments.json           # BigQuery schema definition
 ├── scripts/
-│   ├── production/
-│   │   ├── 21_create_warehouse_tables.sql  # DDL — Fact & Dimension tables
-│   │   ├── 22_populate_warehouse.sql       # Batch ingestion (50k COMMIT chunks)
-│   │   ├── 24_audit_checksum.sql           # Data integrity validation gate
-│   │   └── 40_export_tableau_data.sql      # Pre-aggregated export script
-│   └── schema/
-│       ├── 06_create_schema.sql            # Initial DB creation
-│       └── 21_create_warehouse_tables.sql  # Fact/Dim construction
-├── README.md                               # Project overview & engineering summary
-└── TECHNICAL.md                            # This document
+│   ├── production/                             # Phase 1 MySQL ETL pipeline (in order)
+│   │   ├── 00_setup_functions.sql              # Shared UDFs (TitleCase, etc.)
+│   │   ├── 01_load_reference_cities.sql        # Load SimpleMaps cities seed
+│   │   ├── 02_build_reference_zip_city.sql     # ZIP → city golden record (recursive CTE)
+│   │   ├── 03_build_reference_product_categories.sql
+│   │   ├── 04_build_reference_specialties.sql
+│   │   ├── 05_load_staging_payments.sql        # LOAD DATA LOCAL INFILE
+│   │   ├── 07_data_quality_purge.sql           # Remove corrupted rows
+│   │   ├── 08_clean_recipient_names.sql        # TitleCase name normalization
+│   │   ├── 09_clean_province.sql               # Misrouted state/zip correction
+│   │   ├── 10_clean_military.sql               # APO/FPO address standardization
+│   │   ├── 11_clean_locations.sql              # City abbreviation expansion
+│   │   ├── 12_clean_city.sql                   # ZIP-to-city golden record join
+│   │   ├── 13_clean_addresses.sql              # Street suffix normalization
+│   │   ├── 14_clean_hospitals.sql              # Hospital name imputation
+│   │   ├── 15_clean_payers.sql                 # Manufacturer name normalization
+│   │   ├── 16_clean_products.sql               # Product name/category cleaning
+│   │   ├── 17_apply_category_mappings.sql
+│   │   ├── 18_backfill_missing_population.sql
+│   │   ├── 19_clean_recipient_specialty.sql    # Pipe-delimited specialty extraction
+│   │   ├── 20_apply_specialty_mappings.sql
+│   │   ├── 21_create_warehouse_tables.sql      # DDL — Fact & Dimension tables
+│   │   ├── 22_populate_warehouse.sql           # Batch ingestion (50k COMMIT chunks)
+│   │   ├── 23_populate_fact_payments.sql       # UNION ALL unpivot to fact table
+│   │   ├── 24_audit_checksum.sql               # Data integrity validation gate
+│   │   ├── 40_export_tableau_data.sql          # Pre-aggregated export for Tableau
+│   │   └── 99_optimize_performance.sql         # Covering index tuning
+│   ├── schema/
+│   │   └── 06_create_schema.sql                # Initial DB and table creation
+│   └── tests/                                  # Ad-hoc cleaning validation queries
+│       ├── cleaning_test_city.sql
+│       ├── cleaning_test_hospital.sql
+│       ├── cleaning_test_payer.sql
+│       ├── cleaning_test_province.sql
+│       └── cleaning_test_specialty.sql
+├── transform/                                  # Phase 2 dbt project (BigQuery)
+│   ├── dbt_project.yml
+│   ├── packages.yml                            # dbt-utils dependency
+│   ├── macros/
+│   │   ├── clean_hospital_name.sql             # Hospital name normalization macro
+│   │   └── clean_name.sql                      # Recipient name cleaning macro
+│   ├── models/
+│   │   ├── staging/
+│   │   │   ├── src_cms.yml                     # Source definition
+│   │   │   ├── schema.yml                      # Staging data tests
+│   │   │   ├── stg_general_payments.sql        # Base cleaning view
+│   │   │   └── stg_us_cities.sql               # SimpleMaps cities reference view
+│   │   └── marts/
+│   │       ├── schema.yml                      # Mart data tests (29 tests)
+│   │       ├── dim_company.sql
+│   │       ├── dim_date.sql                    # Calendar spine 2013–2026
+│   │       ├── dim_hospital.sql
+│   │       ├── dim_nature_of_payment.sql
+│   │       ├── dim_physician.sql
+│   │       ├── dim_product.sql
+│   │       └── fct_payments.sql                # 17.8M rows — product-level grain
+│   └── seeds/
+│       └── uscities.csv                        # SimpleMaps reference (dbt seed)
+├── requirements.txt
+├── README.md                                   # Project overview & engineering summary
+└── TECHNICAL.md                                # This document
 ```

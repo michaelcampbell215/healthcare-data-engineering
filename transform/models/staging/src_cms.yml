@@ -5,3 +5,4 @@ sources:
     schema: cms_open_payments_raw
     tables:
       - name: raw_general_payments
+        description: 'Raw general payments data from CMS Open Payments 2024 program Year'

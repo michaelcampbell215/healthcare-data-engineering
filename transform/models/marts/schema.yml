@@ -1,0 +1,114 @@
+version: 2
+
+models:
+  - name: dim_physician
+    description: "One row per unique physician recipient.
+      Natural key is recipient_profile_id assigned by CMS."
+    columns:
+      - name: recipient_profile_id
+        tests:
+          - not_null
+          - unique
+      - name: recipient_type
+        tests:
+          - not_null
+
+  - name: dim_hospital
+    description: "One row per unique teaching hospital.
+      Natural key is teaching_hospital_ccn assigned by CMS."
+    columns:
+      - name: teaching_hospital_ccn
+        tests:
+          - not_null
+          - unique
+      - name: recipient_type
+        tests:
+          - not_null
+
+  - name: dim_company
+    description: "One row per unique subsidiary company making payments.
+      Natural key is subsidiary_id assigned by CMS."
+    columns:
+      - name: subsidiary_id
+        tests:
+          - not_null
+          - unique
+      - name: subsidiary_name
+        tests:
+          - not_null
+      - name: payer_name
+        tests:
+          - not_null
+
+  - name: dim_date
+    description: "One row per calendar day from 2013-01-01 through 2026-12-31.
+      Covers all CMS program years. Natural key is full_date — join directly
+      on fct_payments.payment_date."
+    columns:
+      - name: full_date
+        tests:
+          - not_null
+          - unique
+      - name: year
+        tests:
+          - not_null
+      - name: month
+        tests:
+          - not_null
+
+  - name: dim_nature_of_payment
+    description: "Distinct combinations of payment nature and form.
+      Grain is one row per nature/form pair."
+    columns:
+      - name: payment_nature
+        tests:
+          - not_null
+      - name: payment_form
+        tests:
+          - not_null
+
+  - name: fct_payments
+    description: "One row per payment-product combination. A single CMS payment record
+      (record_id) expands to up to 5 rows — one per product slot. Surrogate key
+      payment_id is generated from record_id + product_slot."
+    columns:
+      - name: payment_id
+        tests:
+          - not_null
+          - unique
+      - name: payment_date
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: full_date
+      - name: amount_usd
+        tests:
+          - not_null
+      - name: recipient_profile_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_physician')
+                field: recipient_profile_id
+              config:
+                where: "recipient_type = 'Covered Recipient Physician'"
+      - name: teaching_hospital_ccn
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_hospital')
+                field: teaching_hospital_ccn
+      - name: subsidiary_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_company')
+                field: subsidiary_id
+      - name: payment_nature
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_nature_of_payment')
+                field: payment_nature
