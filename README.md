@@ -326,8 +326,6 @@ See `.env.example` for all required environment variables and authentication opt
 - ~~**Phase 2 — dbt Fact Table:** `fct_payments.sql` — 17.8M rows, surrogate key, 5-slot UNION ALL unpivot~~ ✅ Complete
 - ~~**Phase 2 — dbt Tests:** `schema.yml` with 23 tests — not_null, unique, relationships — 23/23 passing~~ ✅ Complete
 - **Phase 2 — Merge:** Merge `bigquery-migration` → `main`, tag `v2.0-bigquery-migration`
-- **Phase 3 — Load Historical Years:** Extend pipeline to load 2013–2023 program years into the same BigQuery dataset without schema changes
-- **Phase 3 — Research Payments:** Extend to `raw_research_payments`, build cross-dataset conflict-of-interest flag layer
-- **Phase 3 — Orchestration:** Airflow DAG to automate the full pipeline refresh cycle
-- **Phase 3 — Specialty Standardization:** Port `ref_specialties` synonym mappings ('Orthopaedic Surgery' → 'Orthopedic Surgery') as a dbt seed + CASE layer in `dim_physician`
-- **SCD Type 2 on dim_physician/dim_hospital:** Implement full provider geography history for audit-grade compliance tracking across CMS reporting years
+- **Phase 3 — Research Payments (Separate Project):** Ingest CMS Research Payments dataset into the same BigQuery project; extend shared dimension models (`dim_physician`, `dim_company`) to cover both payment types; build a cross-dataset conflict-of-interest flag identifying physicians receiving both general and research payments from the same manufacturer
+- **Phase 3 — Orchestration:** Airflow DAG to automate end-to-end pipeline refresh (GCS upload → BigQuery load → dbt build → export)
+- **Phase 3 — SCD Type 2:** Implement full provider geography history on `dim_physician` and `dim_hospital` for audit-grade compliance tracking across CMS reporting years
